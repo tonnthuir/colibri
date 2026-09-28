@@ -16,6 +16,7 @@
  *   build: make glm   run: SNAP=./glm_tiny ./glm <cap> <expert_bits> <dense_bits>
  *   TF=1 -> teacher-forcing (valida il prefill su tutta la sequenza)
  */
+/* #define PIPE_DEBUG_CHECK 1*/
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,7 @@
 #include <stdatomic.h>                            /* PIPE ready-flags/job queue + PILOT_REAL cross-layer handshake */
 #include <sched.h>                                /* sched_yield: PIPE spin / PILOT barrier */
 #include <unistd.h>
+
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/select.h>                             /* select() serve-loop polling (#68); not on native MinGW */
 #include <sys/socket.h>
@@ -68,6 +70,7 @@
 #include "schema_gbnf.h"                          /* SCHEMA=: JSON-Schema -> GBNF for method F */
 #include "decode_batch.h"
 #include "route_trace.h"                           /* ROUTE_TRACE + .coli_usage, engine-agnostic (#700) */
+#include "exec_trace.h"                            /* optional microsecond execution trace */
 #include "kv_fp8.h"                               /* KV8=1: cache latente in fp8 e4m3 + scala per-riga */
 #include "kv_tq.h"                                /* KV_TQ=3|4: cache latente PolarQuant (rot+polare) */
 #ifdef _OPENMP
@@ -1330,6 +1333,7 @@ static int g_looka=0;    /* LOOKA=1: misura (solo contatori, zero effetti) quant
                           *     un intero giro di disco per lavorare in ombra). */
 static int64_t la_hit[4], la_tot[4];  /* [0]=prev, [1]=skip-attn, [2]=PILOT, [3]=two-step */
 static int la_pred[3][130][16]; static signed char la_val[3][130];
+static _Thread_local uint32_t g_exec_trace_token_base=0;
 static int g_pilot=0;    /* PILOT=1: prefetch pilotato dal router (vedi pilot_prefetch) */
 static int g_pilot_k=8;  /* PILOT_K=k: prefetcha solo le prime k predizioni per posizione */
 static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (miss LRU) in
@@ -2985,6 +2989,7 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal, int de
      * call site. */
     double t0=now_s();
     int rc=expert_load_impl(m,layer,eid,s,fatal,demand);
+    if(rc==0 && g_exec_trace_load_ctx.expert==eid){ exec_trace_load_event(EXEC_EV_IO_COMPLETE); }
     atomic_fetch_add_explicit(&g_edisk_ns,(int64_t)((now_s()-t0)*1e9),memory_order_relaxed);
     return rc;
 }
@@ -3207,7 +3212,7 @@ typedef struct {
     int64_t off;
 } UringRead;
 typedef struct {
-    Model *m; ESlot *s; int layer,eid,fatal;
+    Model *m; ESlot *s; int layer,eid,fatal; uint32_t token;
     st_tensor *tw[3],*tq[3]; int64_t pos[3];
     int pending,done,finalized,error;
 } UringLoad;
@@ -3255,11 +3260,12 @@ static int uring_add_rep_read(UringBatch *b,int li,shards *S,int primary_fd,
 }
 /* Returns the load index. URING is intentionally a quantized streaming path;
  * unsupported layouts fail instead of silently dropping back to pread. */
-static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int fatal){
+static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int fatal,uint32_t token){
     if(b->nload>=URING_LOAD_MAX){ errno=E2BIG; return -1; }
     int li=b->nload++;
     UringLoad *l=&b->load[li]; memset(l,0,sizeof(*l));
-    l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal;
+    l->m=m; l->s=s; l->layer=layer; l->eid=eid; l->fatal=fatal; l->token=token;
+    if(token) exec_trace_event(EXEC_EV_IO_QUEUED,token,layer,eid,expert_route(layer,eid));
     char nm[3][288],qn[320]; const char suf[3][16]={"gate_proj","up_proj","down_proj"};  /* bounded suf: see #484 */
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
     snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
@@ -3388,10 +3394,11 @@ static void uring_reap(UringBatch *b){
             atomic_fetch_add_explicit(&g_mir_nread[r->rep],1,memory_order_relaxed);
         }else if(!l->error) l->error=cqe.res<0?-cqe.res:EIO;
         if(l->pending>0) l->pending--;
-        if(l->pending==0) l->done=1;
+        if(l->pending==0){ l->done=1; if(l->token) exec_trace_event(EXEC_EV_IO_COMPLETE,l->token,l->layer,l->eid,expert_route(l->layer,l->eid)); }
     }
 }
 static int uring_submit_batch(UringBatch *b){
+    for(int i=0;i<b->nload;i++) if(b->load[i].token) exec_trace_event(EXEC_EV_IO_SUBMIT,b->load[i].token,b->load[i].layer,b->load[i].eid,expert_route(b->load[i].layer,b->load[i].eid));
     if(coli_uring_enter(&b->ring,0)<0) return -1;
     uring_reap(b); return 0;
 }
@@ -3431,6 +3438,7 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes+fo*4,
         memory_order_relaxed);
     if(publish_eid) s->eid=l->eid;
+    if(l->token) exec_trace_event(EXEC_EV_EXPERT_READY,l->token,l->layer,l->eid,expert_route(l->layer,l->eid));
     l->finalized=1; return 0;
 }
 static int uring_wait_all(UringBatch *b){
@@ -4915,6 +4923,56 @@ static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
     return !(est_fmt==4 && fmt==4 && gs!=est_gs);
 }
 
+/* Finish one compute-sequence entry: hand back everything the entry owns. Exactly
+ * one place does this, because every exit from the sequence loop — including the
+ * experts skipped without computing (ablation, zero rows, a slot another backend
+ * already resolved) — owns resources:
+ *   - the in-flight eslot ref pipe_seq_find_ready() took;
+ *   - a scratch WS slot, if the load fell back to pipe_scratch_load();
+ *   - the expert's WS slot itself, plus the PipeJob object.
+ * The WS slot is released whether or not the expert is promoted: the pool holds a
+ * fixed WS_NSLOTS entries and every claim must come back, or the workers park on
+ * ws_free==0 forever. The in-flight ref is dropped BEFORE the cache swap: the swap
+ * exchanges whole ESlot structs, so after it &m->ws[wq] holds the EVICTED expert's
+ * counters and eslot_release() there would underflow the wrong slot. */
+static void moe_seq_finish(Model *m, int layer, PipeSeqEntry *se){
+    if(ws_tok_valid(se->scratch)){ pipe_scratch_release(se->scratch); se->scratch = WS_NONE; }
+    PipeJob *wj = se->job;
+    WsToken tok = wj ? wj->ws_tok : WS_NONE;
+    /* The slot that currently holds this expert: the job's WS slot under PIPE, or
+     * the positional ws[q] a PIPE=0 load wrote (PIPE=0 never touches the
+     * allocator, so there is no token to name it — eslot is the only handle). */
+    ESlot *src = ws_tok_valid(tok) ? &m->ws[WS_SLOT(tok)] : se->eslot;
+    if(se->ref && src){ eslot_release(src); se->ref = 0; }
+    /* Promotion: only for a loaded expert (a miss) that was given a cache home.
+     * This used to be gated together with the release, which is what leaked the
+     * WS slots; it also only ran for jobs, so the PIPE=0 reference path lost the
+     * FASE D cache swap entirely. */
+    if(src && se->needs_io && se->dst_cache_slot >= 0 && m->ecache && m->ecache[layer]){
+        ESlot *Sl = m->ecache[layer], *dst = &Sl[se->dst_cache_slot];
+	if (se->dst_cache_slot >= m->ecn[layer]) {
+	    m->ecn[layer] = se->dst_cache_slot;
+	}
+        ESlot tmp = *dst; *dst = *src; *src = tmp;
+        ecache_publish(m, layer, dst, dst->eid);
+        dst->used = (uint64_t)__atomic_add_fetch(&m->eclock, 1, __ATOMIC_RELAXED);
+    }
+    if(wj && ws_tok_valid(tok)){
+        /* pipe_job_release() is the only legal way back: it moves the job to
+         * RELEASED, clears ws_tok and returns the slot to the pool (idempotent).
+         * Calling pipe_ws_release() directly, as this loop used to, left the job
+         * CONSUMING with a still-valid token — so a later release would hand the
+         * same slot out twice. It runs AFTER the swap: handing the slot back first
+         * would let a worker start overwriting the buffer mid-swap. */
+        pipe_job_release(wj);
+        free(wj);                              /* restores the free Step 10 dropped */
+        se->job = NULL;
+    }
+    /* A job that never owned a slot (cancelled while queued, still QUEUED) is left
+     * allocated on purpose: it may still sit in the queue's lookup table, and
+     * freeing it there would leave a dangling pointer for a worker to follow. */
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
@@ -4926,6 +4984,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             pthread_cond_wait(&g_pilot_cv,&g_pilot_mx);
         pthread_mutex_unlock(&g_pilot_mx);
     }
+    /* Set current layer context for workers */
+    atomic_store_explicit(&g_cur_pipe_layer, layer, memory_order_release);
     Cfg *c=&m->c; int D=c->hidden, E=c->n_experts, K=c->topk, I=c->moe_inter;
     /* DISK-CLASS: does THIS call need the pre-bump recency snapshot? Must agree with
      * dc_needed() in expert_load_impl -- that's what reads what this writes. touched[]
@@ -4949,6 +5009,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(!rank_buf||!rank_w){ free(rank_buf); free(rank_w); rank_buf=NULL; rank_w=NULL; do_cache_route=0; }
     }
     /* ---- FASE A: routing di tutte le S posizioni ---- */
+    for(int s=0;s<S;s++) exec_trace_event(EXEC_EV_ROUTER_BEGIN,g_exec_trace_token_base+(uint32_t)s,layer,-1,-1);
     double route_t0=g_prof?now_s():0;
     int *idxs=xalloc((size_t)S*K*sizeof(int),"moe idxs"); float *ws=xalloc((size_t)S*K*sizeof(float),"moe ws");
     int *keff=xalloc((size_t)S*sizeof(int),"moe keff");
@@ -5137,6 +5198,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
         }
         keff[s]=Ke; m->ereq+=Ke;
+        for(int kk=0;kk<Ke;kk++) exec_trace_event(EXEC_EV_EXPERT_SELECTED,g_exec_trace_token_base+(uint32_t)s,layer,idx[kk],-1);
+        exec_trace_event(EXEC_EV_ROUTER_END,g_exec_trace_token_base+(uint32_t)s,layer,-1,-1);
         for(int kk=0;kk<Ke;kk++){
             if(m->eusage&&m->eusage[layer]) m->eusage[layer][idx[kk]]++;
             ehit_mark(m,layer,idx[kk]);
@@ -5322,11 +5385,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             continue;
         }
 #endif
-        ESlot *use[64]; int missk[64]; int qof[64]; int nmiss=0;
+        ESlot *use[64]; int missk[64]; int qof[64]; PipeJob *qjob[64]; int nmiss=0;
+        /* Consumer-borrowed scratch slots, indexed by the miss ORDINAL (qof[] /
+         * cqof[]), not by ws[] index: a demand wait that produced no job or no
+         * slot loads the expert into one of these instead of exiting, and the
+         * block's release site hands them all back (it walks missk[] by the same
+         * ordinal, so nothing can be forgotten). */
+        WsToken scratch[64];
+        for(int q=0;q<64;q++) scratch[q]=WS_NONE;
 #ifdef COLI_VULKAN
         int vk_hit[64]={0};
 #endif
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1;
+        PipeSeqEntry seq[64]; int seq_n = 0;
+        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL; qof[j]=-1; qjob[j]=NULL;
 #ifdef COLI_VULKAN
             /* VK VRAM tier first: registry-served experts need NO RAM slot and NO disk
              * load (the whole point) — and skipping the LRU recency bump lets them age
@@ -5337,13 +5408,19 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
 #endif
             use[j]=pin_indexed(m,layer,eid);
-            if(use[j]){ m->hits++; m->hit_pin++; }
+	    if(use[j]){ m->hits++; m->hit_pin++; }
+            /* No eslot_acquire() on a pin hit: the compute sequence holds one ref per
+             * entry for exactly as long as it needs the slot (pipe_seq_find_ready takes
+             * it, moe_seq_finish drops it). The acquire this loop used to do had no
+             * matching release anywhere, so every pin hit left its slot busy forever. */
             if(!use[j]){
                 use[j]=ecache_indexed(m,layer,eid,0);
                 if(use[j]){ m->hits++; m->hit_ecache++; use[j]->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
             }
-            if(!use[j]){ qof[j]=nmiss; use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++;
-                if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; } }
+            if(!use[j]){
+                qof[j]=nmiss; use[j]=NULL; missk[nmiss++]=j; qjob[j]=NULL; m->miss++;
+                if(g_disk_split){ if(m->ld_ctx==1) m->miss_draft++; else if(m->ld_ctx==2) m->miss_absorb++; }
+            }
         }
         int metal_done=0;
 #ifdef COLI_METAL
@@ -5436,15 +5513,49 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(g_pipe){                            /* PIPE: launch loads async, matmul overlaps them */
                 if(!g_pp.started) pipe_init(m);
                 double t0=now_s();
-                int eids[64]; for(int q=0;q<nmiss;q++) eids[q]=uniq[base+missk[q]];
-                pipe_dispatch(m,layer,eids,nmiss);
+			for(int q=0;q<nmiss;q++){
+			  int te=uniq[base+missk[q]];
+			  int td=expert_route(layer,te);
+			  int j=missk[q];
+			  exec_trace_event(EXEC_EV_DEMAND_LOAD_REQUEST,g_exec_trace_token_base,layer,te,td);
+			  exec_trace_event(EXEC_EV_IO_QUEUED,g_exec_trace_token_base,layer,te,td);
+			  qjob[j]=pipe_enqueue_demand(m,layer,te,g_exec_trace_token_base);
+			}
                 m->t_ewait += now_s()-t0;           /* dispatch only; the reads overlap matmul and
                                                      * are timed as service inside expert_load */
             } else { double t0=now_s();             /* ORIGINALE: blocking parallel load */
                 #pragma omp parallel for schedule(dynamic,1)
-                for(int q=0;q<nmiss;q++) expert_load(m,layer,uniq[base+missk[q]],&m->ws[q],1,1);   /* demand=1: this IS the miss path */
+                for(int q=0;q<nmiss;q++){ int te=uniq[base+missk[q]]; int td=expert_route(layer,te); exec_trace_event(EXEC_EV_DEMAND_LOAD_REQUEST,g_exec_trace_token_base,layer,te,td); exec_trace_load_ctx_set(g_exec_trace_token_base,layer,te,td); exec_trace_load_event(EXEC_EV_IO_SUBMIT); expert_load(m,layer,te,&m->ws[q],1,1); exec_trace_load_ctx_clear(); }
+                for(int q=0;q<nmiss;q++) use[missk[q]]=&m->ws[q];
                 m->t_ewait += now_s()-t0; }         /* compute thread blocked for the whole load */
         }
+        seq_n = 0;
+        for(int j=0;j<nb;j++){
+            PipeSeqEntry *e = &seq[seq_n++];
+            e->expert_id = uniq[base+j];
+            e->needs_io  = (qof[j] >= 0) ? 1 : 0;   /* miss, whether PIPE is on or not */
+            e->cached    = !e->needs_io;
+            e->job       = qjob[j];  /* NULL: resident, a PIPE=0 miss, or a rejected dup */
+            e->eslot     = use[j];   /* resident slot / PIPE=0's ws[q]; NULL while I/O pending */
+            e->consumed  = 0;
+            e->ref       = 0;
+            e->scratch   = WS_NONE;
+            e->dst_cache_slot = -1;
+            /* Collect multi-token activation: which positions use this expert
+             * and at what routing weight. */
+            e->nr = 0;
+            for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                if(idxs[(int64_t)s*K+kk] == e->expert_id){
+                    e->rows[e->nr] = s;
+                    e->rw[e->nr]   = ws[(int64_t)s*K+kk];
+                    e->nr++;
+                    break;
+                }
+        }
+        /* Pre-compute cache promotion targets before execution starts.
+         * Cache victim/final-location decisions are established now, before
+         * any expert executes, so the per-expert path has predetermined targets. */
+        pipe_seq_compute_promotions(m, layer, seq, seq_n);
         /* I/O ASINCRONO: readahead (WILLNEED) del blocco SUCCESSIVO mentre calcoliamo
          * questo — il kernel legge in background, le pread dopo trovano cache calda */
         if(base+64<nu){
@@ -5470,26 +5581,110 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             /* PIPE drain. Two reasons this barrier is mandatory here, and not optional:
              *  1) MB_BUILD(1) hands the missed experts' slabs straight to the GPU — a slot still
              *     being pread by an I/O worker would be matmul-ed half-loaded.
-             *  2) PIPE's only drain barrier is the per-expert pipe_wait() in the CPU matmul loop
-             *     below, which metal_done SKIPS ENTIRELY. Without this, a still-writing worker
-             *     would race the end-of-block LRU swap that recycles ws[].
-             * pipe_wait() is an idempotent spin on ready[q], so the per-expert waits below stay
-             * correct (and free) when a subset falls back to the CPU. */
+             *  2) PIPE's only drain barrier is the per-expert pipe_queue_wait() in the CPU matmul
+             *     loop below, which metal_done SKIPS ENTIRELY. Without this, a still-writing
+             *     worker would race the end-of-block LRU swap that recycles ws[].
+             * pipe_queue_wait() spins on the job's atomic state, so the per-expert waits below
+             * stay correct (and free) when a subset falls back to the CPU. */
+            int miss_gpu_ok = 1;                    /* 0 = a miss had to be dropped to the CPU */
             if(g_pipe && nmiss){ double tw=now_s();
-                for(int q=0;q<nmiss;q++) pipe_wait(q);
-                m->t_ewait += now_s()-tw; }
-            MB_BUILD(1, 0);                                   /* missed experts, now loaded */
+                /* Metal PIPE drain — wait for I/O, then release.
+                 * The Metal drain is one of several possible wait sites.
+                 * Job lifetime is managed per-expert: after GPU computation,
+                 * the Metal path releases each job's WS slot and performs cache
+                 * promotion. No batch-wide drain or free site needed. */
+	        /* When adding Pilot reads to the PIPE workers, make sure this loop only waits on the DEMAND reads, not the PILOT reads */
+                for(int q=0;q<nmiss;q++){
+                    int mj = missk[q];
+                    PipeJob *wj = qjob[mj];
+                    int te = uniq[base+mj];
+                    if(wj){
+                        exec_trace_event(EXEC_EV_WAIT_BEGIN,g_exec_trace_token_base,layer,te,wj->job_id);
+                        /* MB_BUILD(1,0) just below hands the missed experts'
+                         * slabs to the GPU, and metal_done skips the CPU loop
+                         * that would otherwise resolve use[]. Bind it here. */
+                        use[mj] = pipe_wait_slot(m, wj, layer, te, &scratch[q]);
+                        /* Metal path in-flight ref: acquire so LRU doesn't evict
+                         * this slot while the GPU is using it. */
+                        if(use[mj]) eslot_acquire(use[mj]);
+                        exec_trace_event(EXEC_EV_WAIT_END,g_exec_trace_token_base,layer,te,wj->job_id);
+                    }
+                    /* No job (rejected duplicate enqueue) or a job that ended with no
+                     * slot: load it synchronously into a scratch slot rather than
+                     * exit(1). If even that cannot be served, MB_BUILD(1,0) below is
+                     * skipped so the CPU matmul loop redoes this subset (cpu_miss
+                     * stays 1) instead of building a NULL expert. */
+                    if(!use[mj]){
+                        use[mj] = pipe_scratch_load(m, layer, te, &scratch[q]);
+                        if(use[mj]) eslot_acquire(use[mj]);
+                        if(!use[mj]) miss_gpu_ok = 0;
+                    }
+                }
+                m->t_ewait += now_s()-tw;
+            }
+            /* miss_gpu_ok==0 means one miss could not be resolved to a slot at all:
+             * building the subset would dereference a NULL expert, so the missed
+             * subset stays on the CPU (cpu_miss must then NOT be cleared). */
+            if(miss_gpu_ok) MB_BUILD(1, 0);                    /* missed experts, now loaded */
+            else nbb = 0;
             if(nbb>0 && mgs_ok){
                 double t0=now_s();
                 if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
                 if(coli_metal_moe_block(nbb,D,I,mfmt,mgs,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
                 m->t_emm += now_s()-t0;
-            } else if(!nbb) cpu_miss=0;   /* see the resident-subset call site above */
+            } else if(!nbb && miss_gpu_ok) cpu_miss=0;   /* see the resident-subset call site above */
             if(mh){ double t0=now_s();
                 if(coli_metal_moe_block_end(mh,out)){ if(mh_shared) shared_on_gpu=1; }
                 else cpu_res=1;
                 m->t_emm += now_s()-t0; mh=NULL; }
             metal_done = (!cpu_res && !cpu_miss);
+
+            /* Metal PIPE drain: release jobs and perform cache promotion for
+             * missed experts after GPU computation. The old guaranteed-drain +
+             * FASE D LRU swap handled this at the end of the block; now each
+             * expert gets its own promotion and release. Cached experts in the
+             * resident subset are untouched by the Metal drain (they were
+             * submitted via the resident path, not the missed path).
+             *
+             * In-flight ref: acquired above (after pipe_wait_slot/pipe_scratch_load).
+             * Release it here after the slot data has been swapped to cache.
+             * (The ws slot is now stale — expert data moved to cache.) */
+            if(g_pipe && nmiss){
+                for(int q=0;q<nmiss;q++){
+                    PipeJob *wj = qjob[missk[q]];
+                    if(wj && ws_tok_valid(wj->ws_tok)) {
+                        int wq = WS_SLOT(wj->ws_tok);
+                        /* Drop the in-flight ref BEFORE the swap below. The swap
+                         * exchanges whole ESlot structs, so once it has run
+                         * &m->ws[wq] holds the EVICTED expert's counters and this
+                         * release would underflow the wrong slot (and leave the
+                         * promoted one busy forever, hiding it from LRU). */
+                        eslot_release(&m->ws[wq]);
+                        if(wj->dst_cache_slot >= 0) {
+                            /* Job slot with promotion target: perform cache promotion + release. */
+                            ESlot *Sl = m->ecache[layer];
+                            ESlot *dst = &Sl[wj->dst_cache_slot];
+                            ESlot tmp = *dst; *dst = m->ws[wq]; m->ws[wq] = tmp;
+                            ecache_unindex(m, layer, dst);
+                            ecache_publish(m, layer, dst, dst->eid);
+                            dst->used = (uint64_t)__atomic_add_fetch(&m->eclock, 1, __ATOMIC_RELAXED);
+                        }
+                        WsToken tok = wj->ws_tok;
+                        wj->ws_tok = WS_NONE;
+                        atomic_store_explicit(&wj->state, PIPE_JOB_RELEASED, memory_order_release);
+                        pipe_ws_release(tok);
+                    }
+                    /* Scratch slot (from pipe_scratch_load): release directly. */
+                    WsToken stok = scratch[q];
+                    scratch[q] = WS_NONE;
+                    if(ws_tok_valid(stok)) {
+                        int wq = WS_SLOT(stok);
+                        pipe_ws_release(stok);
+                        eslot_release(&m->ws[wq]);
+                    }
+                }
+            }
+
             free(mxg); free(mrows); free(mrw);
         }
         #undef MB_BUILD
@@ -5511,6 +5706,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 ESlot *pg_e[64]; int pg_n[64], pg_j[64], npg=0;
                 int prow[64][4]; float pw[64][4];
                 for(int j=0;j<nb;j++){ ESlot *e=use[j]; int eid=uniq[base+j];
+                    /* use[j]==NULL means "still unresolved": a miss whose I/O
+                     * worker has not finished (or a VK-VRAM-resident expert).
+                     * Pass 1 must never touch one — resolving here would take
+                     * eslots_acquire refs on a slot an I/O worker still owns,
+                     * and a stale cuda_eligible flag in a not-yet-loaded slot
+                     * is garbage, not a signal. Sites that need "is a miss"
+                     * must keep testing qof[j]>=0, not !use[j]. */
+                    if(!e) continue;
                     if(!(e->g.cuda_eligible&&e->u.cuda_eligible&&e->d.cuda_eligible)) continue;
                     int nr=0;
                     for(int s=0;s<S && nr<4;s++) for(int kk=0;kk<keff[s];kk++)
@@ -5654,14 +5857,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
              * takes the GPU results (fallback: recompute those rows on the CPU). */
             ColiVkTensor *vg[64],*vu[64],*vd[64]; int veid[64]; int vrows[64], voff[64], vrmap[64*4]; float vwmap[64*4];
             ColiVkTensor *vg2[64],*vu2[64],*vd2[64]; int veid2[64]; int vrows2[64], voff2[64], vrmap2[64*4]; float vwmap2[64*4];
-            ESlot *ce[64]; int cnr[64], crmap[64*4]; float cwmap[64*4]; int cqof[64];
+            ESlot *ce[64]; int ceid[64], cnr[64], crmap[64*4]; float cwmap[64*4]; int cqof[64]; PipeJob *cejob[64];
             int nvk=0, vtot=0, nvk2=0, vtot2=0, ncpu=0;
             double t0=now_s();
             for(int j=0;j<nb;j++){ int eid=uniq[base+j];
                 int nr=0;
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
                     if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
-                if(!nr){ if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; } continue; }
+                if(!nr){ if(g_pipe && qof[j]>=0 && qjob[j]){
+                    /* VK nr==0 path: per-expert wait — wait only, no compute.
+                     * The slot is released here since nobody computes on this expert.
+                     * Cache promotion is skipped (zero activations = no promotion target). */
+                    double tw=now_s();
+                    PipeJob *wj = qjob[j];
+                    exec_trace_event(EXEC_EV_WAIT_BEGIN,g_exec_trace_token_base,layer,uniq[j],wj->job_id);
+                    (void)pipe_wait_job(m, wj);
+                    exec_trace_event(EXEC_EV_WAIT_END,g_exec_trace_token_base,layer,uniq[j],wj->job_id);
+                    m->t_ewait += now_s()-tw;
+                    /* Release the slot — no computation, no promotion needed. */
+                    WsToken vk_stok = wj->ws_tok;
+                    wj->ws_tok = WS_NONE;
+                    atomic_store_explicit(&wj->state, PIPE_JOB_RELEASED, memory_order_release);
+                    pipe_ws_release(vk_stok);
+		  } continue; }
                 if(vk_hit[j]){          /* registry-served: no RAM slot, no disk load */
                     ColiVkTensor **reg=vk_reg_at(layer,eid);
                     if(vk2_on && coli_vk_tensor_dev(reg[0])==1){   /* dev2 tier expert */
@@ -5676,7 +5894,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         vg[nvk]=reg[0]; vu[nvk]=reg[1]; vd[nvk]=reg[2]; veid[nvk]=eid; vrows[nvk]=nr; vtot+=nr; nvk++;
                     }
                 } else {
-                    ce[ncpu]=use[j]; cnr[ncpu]=nr; cqof[ncpu]=qof[j];
+                    /* use[j] is still NULL for a miss here: ce[] carries it and
+                     * is re-bound from the job's token after the wait below. */
+                    ce[ncpu]=use[j]; ceid[ncpu]=eid; cnr[ncpu]=nr; cqof[ncpu]=qof[j]; cejob[ncpu]=qjob[j];
                     for(int r=0;r<nr;r++){ crmap[ncpu*S+r]=rows[r]; cwmap[ncpu*S+r]=rw[r]; }
                     ncpu++;
                 }
@@ -5708,13 +5928,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             {
                 uint8_t vcls[64];
                 for(int c2=0;c2<ncpu;c2++){
-                    if(g_pipe && cqof[c2]>=0) vcls[c2] = pipe_ready(cqof[c2]) ? 0 : 2;   /* loaded : in flight */
+                    if(g_pipe && cqof[c2]>=0 && cejob[c2]) vcls[c2] = (atomic_load_explicit(&cejob[c2]->state, memory_order_acquire)==PIPE_JOB_READY) ? 0 : 2;   /* loaded : in flight */
+                    else if(g_pipe && cqof[c2]>=0)          vcls[c2] = 2;  /* miss whose job is gone/duplicate: the wait below resolves it or borrows a scratch slot */
                     else                      vcls[c2] = ce[c2]->slab       ? 0 : 1;   /* resident : sync miss */
                 }
                 int vord[64], no=0;
                 for(uint8_t k2=0;k2<3;k2++) for(int c2=0;c2<ncpu;c2++) if(vcls[c2]==k2) vord[no++]=c2;
                 for(int oi=0;oi<no;oi++){ int c2=vord[oi]; ESlot *e=ce[c2]; int nr=cnr[c2];
-                    if(g_pipe && cqof[c2]>=0){ double tw=now_s(); pipe_wait(cqof[c2]); m->t_ewait += now_s()-tw; }
+                    if(g_pipe && cqof[c2]>=0){
+                        double tw=now_s();
+                        PipeJob *wj = cejob[c2];
+                        if(wj) exec_trace_event(EXEC_EV_WAIT_BEGIN,g_exec_trace_token_base,layer,ceid[c2],wj->job_id);
+                        /* Slot resolution must happen before e is dereferenced
+                         * for slab / expert_ffn below. A job that yielded no slot (and
+                         * the duplicate-enqueue case with no job at all) is loaded into
+                         * a scratch slot here; if not even that can be served, drop this
+                         * expert with a warning instead of killing the process. */
+                        e = ce[c2] = pipe_wait_slot(m, wj, layer, ceid[c2], &scratch[cqof[c2]]);
+                        /* Vulkan CPU path in-flight ref: acquire so LRU doesn't evict
+                         * this slot while we're about to compute on it. */
+                        if(e) eslot_acquire(e);
+                        if(wj) exec_trace_event(EXEC_EV_WAIT_END,g_exec_trace_token_base,layer,ceid[c2],wj->job_id);
+                        m->t_ewait += now_s()-tw;
+                        if(!e) continue; }
                     if(!e->slab) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
                     double te0=now_s();
@@ -5726,6 +5962,41 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         m->cpu_expert_rows+=(uint64_t)nr; }
                 }
             }
+            /* Vulkan CPU path: release jobs and perform cache promotion for
+             * the ncpu experts after CPU computation. Mirrors the per-expert
+             * release site used by the sequence-driven path.
+             *
+             * In-flight ref: acquired after pipe_wait_slot above.
+             * Release it here after the slot is no longer in use. */
+            if(g_pipe){
+                for(int c2=0;c2<ncpu;c2++){
+                    PipeJob *wj = cejob[c2];
+                    if(!wj) continue;
+                    WsToken stok = scratch[cqof[c2]];
+                    scratch[cqof[c2]] = WS_NONE;
+                    pipe_scratch_release(stok);
+                    WsToken jtok = wj->ws_tok;
+                    if(!ws_tok_valid(jtok)) continue;
+                    int wq = WS_SLOT(jtok);
+                    /* Drop the in-flight ref BEFORE the swap: the swap exchanges whole
+                     * ESlot structs, so after it &m->ws[wq] is the EVICTED expert and
+                     * this release would underflow the wrong slot's counter (abort in
+                     * eslot_release) while the promoted one stays busy forever. */
+                    eslot_release(&m->ws[wq]);
+                    /* Cache promotion if we have a predetermined target. */
+                    if(wj->dst_cache_slot >= 0){
+                        ESlot *Sl = m->ecache[layer];
+                        ESlot *dst = &Sl[wj->dst_cache_slot];
+                        ESlot tmp = *dst; *dst = m->ws[wq]; m->ws[wq] = tmp;
+                        ecache_unindex(m, layer, dst);
+                        ecache_publish(m, layer, dst, dst->eid);
+                        dst->used = (uint64_t)__atomic_add_fetch(&m->eclock, 1, __ATOMIC_RELAXED);
+                    }
+                    wj->ws_tok = WS_NONE;
+                    atomic_store_explicit(&wj->state, PIPE_JOB_RELEASED, memory_order_release);
+                    pipe_ws_release(jtok);
+                }
+            }
             double t_take0=now_s();
             int vk_ok = vk_issued && coli_vk_expert_group_take(vk_yh);
             if(g_prof) m->t_egpu+=now_s()-t_take0;
@@ -5734,12 +6005,32 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *src=vk_yh+(int64_t)(o+r)*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
                 } else {   /* issue/take failed (device lost): load + recompute on the CPU */
-                    ESlot *e=&m->ws[nmiss<63?nmiss:63];
+                    /* The fallback needs a workspace it can call its own. It
+                     * used to borrow ws[nmiss] — one past the last assigned slot
+                     * for the whole group, and once nmiss reached 64 the clamp
+                     * landed on ws[63], which is a live job's slot. Under the pipe
+                     * engine, borrow from the allocator (initialising the table if
+                     * pipe_init() never ran) and hand it back after the matmul; in a
+                     * PIPE=0 build nothing owns ws[] at all, so keep the baseline
+                     * positional borrow. No slot at all -> skip this group's CPU
+                     * recompute rather than exit(1). */
+                    WsToken stok = WS_NONE;
+                    ESlot *e;
+                    if(!g_pipe) e = &m->ws[nmiss<WS_NSLOTS-1 ? nmiss : WS_NSLOTS-1];
+                    else {
+                        pipe_queue_ensure(m);
+                        if(!pipe_ws_acquire_wait(PIPE_JOB_DEMAND, -1, &stok)){
+                            fprintf(stderr, "[PIPE_WS] no scratch slot for the Vulkan CPU fallback; skipping (L%d,E%d)\n", layer, veid[c2]);
+                            continue;
+                        }
+                        e = &m->ws[WS_SLOT(stok)];
+                    }
                     if(e->eid!=veid[c2] || !e->slab) expert_load(m,layer,veid[c2],e,1,0);   /* device-lost recovery: DISK-CLASS leaves it unclassified */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c2*S+r]*D, D*sizeof(float));
                     expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                    pipe_scratch_release(stok);   /* no-op for the PIPE=0 positional borrow */
                 }
             }
             /* dev2 group: taken AFTER dev0's accumulate so the slower card gets the
@@ -5752,91 +6043,239 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *src=vk_yh2+(int64_t)(o+r)*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*src[d]; }
                 } else {
-                    ESlot *e=&m->ws[nmiss<63?nmiss:63];
+                    /* see the dev0 fallback above: an allocated scratch slot under the
+                     * pipe engine, the baseline positional borrow in a PIPE=0 build. */
+                    WsToken stok = WS_NONE;
+                    ESlot *e;
+                    if(!g_pipe) e = &m->ws[nmiss<WS_NSLOTS-1 ? nmiss : WS_NSLOTS-1];
+                    else {
+                        pipe_queue_ensure(m);
+                        if(!pipe_ws_acquire_wait(PIPE_JOB_DEMAND, -1, &stok)){
+                            fprintf(stderr, "[PIPE_WS] no scratch slot for the Vulkan dev2 CPU fallback; skipping (L%d,E%d)\n", layer, veid2[c2]);
+                            continue;
+                        }
+                        e = &m->ws[WS_SLOT(stok)];
+                    }
                     if(e->eid!=veid2[c2] || !e->slab) expert_load(m,layer,veid2[c2],e,1,0);
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap2[c2*S+r]*D, D*sizeof(float));
                     expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
+                    pipe_scratch_release(stok);   /* no-op for the PIPE=0 positional borrow */
                 }
             }
             double dt=now_s()-t0; m->t_emm+=dt;
             if(g_prof) g_vkb_acc+=now_s()-t_take0;   /* take-wait (t_egpu) + result accumulate */
         }
 #endif
-        if(!metal_done && !xexp_done && !vk_active)
-        for(int j=0;j<nb;j++){ int eid=uniq[base+j]; ESlot *e=use[j];
+        /* ---- Sequence-driven CPU execution (pipe_seq_find_ready model) ----
+         * Replace the old per-expert waiting loop with the new compute-sequence-driven
+         * execution model. For each unconsumed sequence entry, pipe_seq_find_ready()
+         * returns the first READY entry (cached = immediate, I/O-bound = waits internally).
+         * After execution, the sequence entry is marked consumed and the loop continues
+         * until all entries are consumed. This removes head-of-line blocking behavior.
+         *
+         * CUDA group collection still happens below for remaining non-cached, non-CUDA
+         * experts; the sequence-driven path handles experts directly.
+         * ---- */
+        if(!metal_done && !xexp_done && !vk_active){
+            /* Sequence-driven execution: consume experts opportunistically from
+             * the compute sequence, not in fixed routing order. */
+            while(1){
+	        pthread_mutex_lock(&g_pipe_queue.mx);
+		exec_trace_event(EXEC_EV_WAIT_BEGIN,g_exec_trace_token_base,layer,-1,-1);
+                PipeSeqEntry *se = pipe_seq_find_ready(m, seq, seq_n);
+		exec_trace_event(EXEC_EV_WAIT_END,g_exec_trace_token_base,layer,-1,-1);
+		pthread_mutex_unlock(&g_pipe_queue.mx);
+                if(!se) break;  /* all sequence entries consumed */
+
+                /* Skip experts already handled by CUDA early-issued path. */
 #ifdef COLI_CUDA
-            if(early_issued && done_j[j]) continue;    /* computing on the GPU right now */
-#endif
-            /* Drain this miss's async load BEFORE the nr==0 early-exit below: every
-             * dispatched slot must be waited before the end-of-block LRU swap can reuse
-             * its ws[] slab, so correctness does not depend on the nr>=1 routing invariant.
-             * Stays ABOVE the METAL skip: a subset that fell back to the CPU still needs its
-             * slot drained here, and under METAL the block-level drain above already ran (this
-             * spin is then a no-op). */
-            if(g_pipe && qof[j]>=0){ double tw=now_s(); pipe_wait(qof[j]); m->t_ewait += now_s()-tw; }
-#ifdef COLI_METAL
-            /* skip the subsets already computed on GPU */
-            if(g_metal_enabled && ((is_miss[j] && !cpu_miss) || (!is_miss[j] && !cpu_res))) continue;
-#endif
-            int nr=0;                                 /* righe (posizioni) che usano questo expert */
-            for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
-                if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
-            if(!nr) continue;
-            /* CAUSAL ABLATION (FASE C, contribution mode): this expert's routing,
-             * counters, and any route trace were already recorded in FASE A; its
-             * weighted output is now replaced by ZERO -> skip its matmul+accumulate.
-             * CPU path only (the ablation harness runs the CPU forward). */
-            if(g_abl.mode==1 && abl_zero_contrib(&g_abl, layer, eid)) continue;
-#ifdef COLI_CUDA
-            if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
-            if(group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible && e->d.cuda_eligible &&
-               !omp_in_parallel()){
-                group_e[ngroup]=e; group_n[ngroup]=nr;
-                for(int r=0;r<nr;r++){ group_row[(int64_t)ngroup*S+r]=rows[r]; group_weight[(int64_t)ngroup*S+r]=rw[r]; }
-                ngroup++; continue;
-            }
-#endif
-            const float *xsrc=E8_XE(e);
-            for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, xsrc+(int64_t)rows[r]*D, D*sizeof(float));
-            double t0=now_s();
-#ifdef COLI_CUDA
-            if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible && e->u.cuda_eligible &&
-               e->d.cuda_eligible && !omp_in_parallel() &&
-               coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
-                for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D,wgt=rw[r],*hr=hh+(int64_t)r*D;
-                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-                double dt=now_s()-t0;m->t_emm+=dt;if(g_prof)m->t_egpu+=dt;continue;
-            }
-            if(!e->slab) expert_host_ensure(m,layer,e);
-#endif
-            /* quantizzazione sollevata: raccogli le righe int8 accanto al gather f32 e
-             * pubblica il contesto per il ramo IDOT di matmul_qt_ex. Solo quando l'input
-             * e' x originale (mai la copia ruotata fmt=6) e gate/up lo consumerebbero.
-             * EN: hoisted quantization — gather the int8 rows next to the f32 gather and
-             * publish the context for matmul_qt_ex's IDOT branch. Only when the input is
-             * the original x (never the fmt=6 rotated copy) and gate/up would take it. */
-            g_pq.x=NULL;
-            if(xsrc==x && pq_want(&e->g,&e->u,nr)){
-                if(!pq_ready){
-                    if(!xq_all){
-                        xq_all=xalloc((size_t)S*D,"moe xq"); sx_all=xalloc((size_t)S*sizeof(float),"moe sx");
-                        xqg   =xalloc((size_t)S*D,"moe xqg"); sxg  =xalloc((size_t)S*sizeof(float),"moe sxg");
-                        xsum_all=xalloc((size_t)S*sizeof(int32_t),"moe xsum");
-                        xsumg   =xalloc((size_t)S*sizeof(int32_t),"moe xsumg");
+                {
+                    int i = (int)(se - seq);
+                    if(early_issued && done_j[i]) {
+                        se->consumed = 1;
+                        moe_seq_finish(m, layer, se);   /* still owns a WS slot + ref */
+                        continue;
                     }
-                    pq_build(x,S,D,xq_all,sx_all); pq_build_xsum(xq_all,S,D,xsum_all); pq_ready=1;
                 }
-                for(int r=0;r<nr;r++){ memcpy(xqg+(int64_t)r*D, xq_all+(int64_t)rows[r]*D,(size_t)D); sxg[r]=sx_all[rows[r]]; xsumg[r]=xsum_all[rows[r]]; }
-                g_pq.x=xg; g_pq.S=nr; g_pq.I=D; g_pq.xq=xqg; g_pq.sx=sxg; g_pq.xsum=xsumg;
+#else
+                (void)se;  /* suppress unused */
+#endif
+
+                /* Safety guard: skip entries already consumed. */
+                if(se->consumed) continue;
+
+                /* Skip entries with zero activations (shouldn't happen, but be safe). */
+                if(!se->nr) { se->consumed = 1; moe_seq_finish(m, layer, se); continue; }
+
+                /* CAUSAL ABLATION (FASE C, contribution mode). */
+                if(g_abl.mode==1 && abl_zero_contrib(&g_abl, layer, se->expert_id)) {
+                    se->consumed = 1; moe_seq_finish(m, layer, se); continue;
+                }
+
+                /* Resolve ESlot and execute based on expert type. */
+                ESlot *e;
+                if(se->job) {
+                    /* I/O-bound expert: get the ESlot from the job's WS slot.
+                     * pipe_seq_find_ready() already waited for I/O completion and
+                     * claimed the job (READY -> CONSUMING). pipe_wait_slot() covers
+                     * the rare case where no worker ever owns the job (an enqueue
+                     * rejected as a duplicate, or a cancel): it loads into a scratch
+                     * slot recorded on the entry, so the expert still contributes
+                     * instead of being silently dropped from the output. */
+                    e = pipe_wait_slot(m, se->job, layer, se->expert_id, &se->scratch);
+                    if(!e) { se->consumed = 1; moe_seq_finish(m, layer, se); continue; }
+                } else if(se->eslot) {
+                    /* Already resident: the pin/ecache slot bound at resolution, or
+                     * (PIPE=0) the positional ws[q] the blocking load just wrote.
+                     * Looking the expert up again here could hand back a DIFFERENT
+                     * slot than the one the entry was built around, and a slot can
+                     * lose its slab to rss_guard in between, so keep the ensure. */
+                    e = se->eslot;
+#ifdef COLI_CUDA
+                    /* Only the CUDA tier detaches a host slab (expert_host_release),
+                     * and expert_host_ensure is built in that configuration only. */
+                    if(!e->slab) expert_host_ensure(m, layer, e);
+#endif
+                } else if(se->needs_io) {
+                    /* A miss with neither a job nor a bound slot: the enqueue was
+                     * rejected as a duplicate, or the sequence was built before the
+                     * dispatch section ran (the original bug: that made every entry
+                     * look like this and the block slept on cv_ready forever). Load
+                     * it into a borrowed slot so the expert still contributes, and
+                     * say so loudly once — silently dropping a routed expert is a
+                     * numerics bug that no log would explain. */
+                    static int warned_early_seq;
+                    if(g_pipe && !warned_early_seq){ warned_early_seq=1;
+                        fprintf(stderr, "[PIPE] compute-sequence entry L%d E%d has no PipeJob: "
+                                "the sequence was built before the load dispatch, or the enqueue "
+                                "was rejected as a duplicate. Falling back to a scratch load.\n",
+                                layer, se->expert_id); }
+                    e = pipe_scratch_load(m, layer, se->expert_id, &se->scratch);
+                    if(!e){ se->consumed = 1; moe_seq_finish(m, layer, se); continue; }
+                } else {
+                    /* Nothing to compute on: a Vulkan VRAM-registry hit (that backend
+                     * excludes this loop entirely) or a resident expert that vanished. */
+                    se->consumed = 1; moe_seq_finish(m, layer, se); continue;
+                }
+
+                /* CUDA group collection for non-cached, GPU-eligible experts.
+                 * Only runs if this expert wasn't already handled by CUDA
+                 * early-issued (checked above via done_j). */
+#ifdef COLI_CUDA
+                if(g_cuda_enabled && e->g.cuda_eligible) m->gpu_expert_calls++;
+                if(group_enabled && g_cuda_enabled && e->g.cuda_eligible &&
+                   e->u.cuda_eligible && e->d.cuda_eligible && !omp_in_parallel()) {
+                    group_e[ngroup]=e; group_n[ngroup]=se->nr;
+                    for(int r=0;r<se->nr;r++){
+                        group_row[(int64_t)ngroup*S+r]=se->rows[r];
+                        group_weight[(int64_t)ngroup*S+r]=se->rw[r];
+                    }
+                    /* NOTE: deliberately NOT moe_seq_finish() here. The GPU reads this
+                     * slot after the group is taken, so handing the WS slot back (or
+                     * swapping it into the cache) now would race the kernel. The CUDA
+                     * group path still has no WS-release site after removing
+                     * the block-wide one — this needs testing and validation. Not reachable in a
+                     * CPU-only build. */
+                    ngroup++; se->consumed = 1; continue;
+                }
+#endif
+
+                /* Execute the expert using multi-token activation data from
+                 * the sequence entry (se->rows[] and se->rw[]). */
+                const float *xsrc = E8_XE(e);
+                for(int r=0;r<se->nr;r++)
+                    memcpy(xg+(int64_t)r*D, xsrc+(int64_t)se->rows[r]*D, D*sizeof(float));
+                double t0=now_s();
+#ifdef COLI_CUDA
+                if(!group_enabled && g_cuda_enabled && e->g.cuda_eligible &&
+                   e->u.cuda_eligible && e->d.cuda_eligible && !omp_in_parallel() &&
+                   coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,se->nr)){
+                    for(int r=0;r<se->nr;r++){
+                        float *os=out+(int64_t)se->rows[r]*D,wgt=se->rw[r],
+                              *hr=hh+(int64_t)r*D;
+                        for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+                    }
+                    double dt=now_s()-t0;m->t_emm+=dt;if(g_prof)m->t_egpu+=dt;
+                    se->consumed = 1; continue;
+                }
+                if(!e->slab) expert_host_ensure(m,layer,e);
+#endif
+                /* Hoisted activation quantization context (same as before). */
+                g_pq.x=NULL;
+                if(xsrc==x && pq_want(&e->g,&e->u,se->nr)){
+                    if(!pq_ready){
+                        if(!xq_all){
+                            xq_all=xalloc((size_t)S*D,"moe xq");
+                            sx_all=xalloc((size_t)S*sizeof(float),"moe sx");
+                            xqg   =xalloc((size_t)S*D,"moe xqg");
+                            sxg  =xalloc((size_t)S*sizeof(float),"moe sxg");
+                            xsum_all=xalloc((size_t)S*sizeof(int32_t),"moe xsum");
+                            xsumg   =xalloc((size_t)S*sizeof(int32_t),"moe xsumg");
+                        }
+                        pq_build(x,S,D,xq_all,sx_all);
+                        pq_build_xsum(xq_all,S,D,xsum_all); pq_ready=1;
+                    }
+                    for(int r=0;r<se->nr;r++){
+                        memcpy(xqg+(int64_t)r*D, xq_all+(int64_t)se->rows[r]*D,(size_t)D);
+                        sxg[r]=sx_all[se->rows[r]];
+                        xsumg[r]=xsum_all[se->rows[r]];
+                    }
+                    g_pq.x=xg; g_pq.S=se->nr; g_pq.I=D;
+                    g_pq.xq=xqg; g_pq.sx=sxg; g_pq.xsum=xsumg;
+                }
+                /* Expert computation (same as before, using se->nr/se->rows/rw). */
+                expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,se->nr,I);
+                for(int r=0;r<se->nr;r++){
+                    float *os=out+(int64_t)se->rows[r]*D, wgt=se->rw[r],
+                          *hr=hh+(int64_t)r*D;
+                    for(int d=0;d<D;d++) os[d]+=wgt*hr[d];
+                }
+                double dt=now_s()-t0;
+                m->t_emm+=dt;
+                if(g_prof){m->t_ecpu+=dt;
+                    m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
+                    m->cpu_expert_rows+=(uint64_t)se->nr;}
+
+                /* Per-expert cache promotion, then hand everything back.
+                 * moe_seq_finish() releases the WS slot for EVERY entry that owns
+                 * one, promoted or not */
+                se->consumed = 1;
+                moe_seq_finish(m, layer, se);
             }
-            expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
-            for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
-                for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
-            double dt=now_s()-t0;m->t_emm+=dt;if(g_prof){m->t_ecpu+=dt;
-                m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
-                m->cpu_expert_rows+=(uint64_t)nr;}
+            /* CUDA group collection: for non-cached experts not already handled
+             * by CUDA early-issued, collect GPU-eligible ones into groups.
+             * (Cached experts already executed above; I/O-bound handled by CUDA
+             * early-issued path. This catches the case where groups weren't
+             * issued early but some non-collected experts remain.) */
+#ifdef COLI_CUDA
+            if(g_cuda_enabled && !g_pre_sh){
+                for(int j=0;j<nb;j++){ int eid=uniq[base+j];
+                    /* Skip cached experts — already handled by sequence loop. */
+                    int is_cached = 0;
+                    for(int si=0;si<seq_n;si++)
+                        if(seq[si].expert_id==eid && seq[si].cached){ is_cached=1; break; }
+                    if(is_cached) continue;
+                    /* Skip experts already handled by CUDA early-issued. */
+                    if(early_issued && done_j[j]) continue;
+                    ESlot *e = use[j];
+                    int nr=0;
+                    for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++)
+                        if(idxs[(int64_t)s*K+kk]==eid){ rows[nr]=s; rw[nr]=ws[(int64_t)s*K+kk]; nr++; break; }
+                    if(!nr || !e) continue;
+                    if(group_enabled && g_cuda_enabled && e->g.cuda_eligible &&
+                       e->u.cuda_eligible && e->d.cuda_eligible && !omp_in_parallel()){
+                        group_e[ngroup]=e; group_n[ngroup]=nr;
+                        for(int r=0;r<nr;r++){
+                            group_row[(int64_t)ngroup*S+r]=rows[r];
+                            group_weight[(int64_t)ngroup*S+r]=rw[r];
+                        }
+                        ngroup++;
+                    }
+                }
+            }
+#endif
         }
 #ifdef COLI_CUDA
         /* Inc.4 take phase: the CPU loop above ran while the GPU computed the issued
@@ -5986,24 +6425,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(g_prof){double mx=0;for(int di=0;di<g_cuda_ndev;di++)if(dev_time[di]>mx)mx=dev_time[di];m->t_egpu+=mx;}
         m->t_emm+=now_s()-tg;
 #endif
-        /* No drain barrier: the per-expert pipe_wait(qof[j]) above (issued for every
-         * dispatched miss slot, before the nr==0 skip) already waited on all ws[] loads
-         * for this block, so they are complete before the LRU swap — and the gen-tagged
-         * cursor keeps any still-spinning worker off a wrong-generation slot. */
-        { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
-          int promo = nmiss<m->ecap ? nmiss : m->ecap;
-          for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
-              if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=eslot_lru_victim(Sl,*nn,m->ecap);
-                     if(lru<0){ static int warned;
-                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
-                         continue; }
-                     dst=&Sl[lru]; }
-              ecache_unindex(m,layer,dst);
-              ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
-              ecache_publish(m,layer,dst,dst->eid);
-              dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
-        }
+        /* ---- End of all matmul paths (Metal, VK, CPU) ---- */
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
     if(!with_shared) goto shared_done;
@@ -6071,7 +6493,66 @@ shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     g_pq.x=NULL;   /* xg sta per essere liberato: nessun contesto deve sopravvivergli
                     * EN: xg is about to be freed — no context may outlive it */
-    free(xq_all); free(sx_all); free(xqg); free(sxg); free(xsum_all); free(xsumg);
+    /* PIPE sanity check (debug): verify no in-flight references or
+     * dangling job/slot state at the end of layer processing.
+     * Gated by PIPE_DEBUG_CHECK so it's only active in debug builds. */
+#ifdef PIPE_DEBUG_CHECK
+    {
+        int errors = 0;
+
+        /* 1) All m->ws[] slots should have inflight == 0 */
+        for(int s = 0; s < WS_NSLOTS; s++) {
+            if(eslot_busy(&m->ws[s])) {
+                fprintf(stderr, "[PIPE_DEBUG] SANITY: m->ws[%d] (eid=%d) still inflight=%u at end of moe() L%d\n",
+                        s, m->ws[s].eid, m->ws[s].in_flight, layer);
+                errors++;
+            }
+        }
+
+        /* 2) All ws_tab entries: owned slots must have inflight == 0
+         *    (the slot has been released, so inflight must already be 0). */
+        for(int s = 0; s < WS_NSLOTS; s++) {
+            WsSlotEnt *t = &g_pipe_queue.ws_tab[s];
+            if(t->owned && eslot_busy(&m->ws[s])) {
+                fprintf(stderr, "[PIPE_DEBUG] SANITY: ws_tab[%d] still owned AND inflight at end of moe() L%d\n",
+                        s, layer);
+                errors++;
+            }
+        }
+
+        /* 3) All queued PipeJobs should have ws_tok == WS_NONE
+         *    (they've been claimed and released by workers). */
+        /* This is hard to check directly since we don't have a list of all jobs.
+         * Instead, check the ws_free counter: it should match the number of free slots. */
+        int reported_free = g_pipe_queue.ws_free;
+        int actual_free = 0;
+        for(int s = 0; s < WS_NSLOTS; s++) {
+            if(!g_pipe_queue.ws_tab[s].owned) actual_free++;
+        }
+        if(reported_free != actual_free) {
+            fprintf(stderr, "[PIPE_DEBUG] SANITY: ws_free=%d but actual free=%d at end of moe() L%d\n",
+                    reported_free, actual_free, layer);
+            errors++;
+        }
+
+        /* 4) Total queued jobs should be 0 (all claimed and released). */
+        int total = (int)atomic_load_explicit(&g_pipe_queue.total_jobs, memory_order_acquire);
+        if(total != 0) {
+            fprintf(stderr, "[PIPE_DEBUG] SANITY: %d queued jobs remain at end of moe() L%d\n",
+                    total, layer);
+            errors++;
+        }
+
+        if(errors) {
+            fprintf(stderr, "[PIPE_DEBUG] SANITY FAILED: %d error(s) at end of moe() layer %d — check in-flight refs and job state\n",
+                    errors, layer);
+        } else {
+            fprintf(stderr, "[PIPE_DEBUG] SANITY OK at end of moe() layer %d\n", layer);
+        }
+    }
+#endif
+
+
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
     #undef E8_XE
 #ifdef COLI_CUDA
@@ -6165,13 +6646,13 @@ static void la_predict(Model *m, int target, const float *h, int kind){
  * del fadvise BLOCCA (~0.5ms x 169k chiamate = +92s/48 token, misurato) — inline
  * il pilota costava piu' di quanto rendesse. Ring lock-free 1P/1C; pieno = scarta
  * (un hint perso non e' un errore). */
-static struct { _Atomic int l,e; } pilot_q[4096];  /* payload atomico (relaxed): la claim SPMC legge speculativamente prima della CAS e scarta se perde -> senza _Atomic sarebbe una data race C11 col produttore. int e' sempre lock-free: stessa size/align. */
+static struct { _Atomic int l,e; _Atomic uint32_t token; } pilot_q[4096];  /* payload atomico (relaxed): la claim SPMC legge speculativamente prima della CAS e scarta se perde -> senza _Atomic sarebbe una data race C11 col produttore. int e' sempre lock-free: stessa size/align. */
 static volatile unsigned pilot_w=0, pilot_r=0;
 static Model *pilot_m=NULL;
 /* PILOT_REAL: load VERO dell'expert predetto dentro la LRU del layer FUTURO. Vedi
  * l'invariante di sicurezza accanto a g_pilot_real. Il pread (lento) gira FUORI dal lock;
  * il lock protegge solo la scelta/pubblicazione dello slot e l'handshake col main. */
-static void pilot_realload(Model *m, int layer, int eid){
+static void pilot_realload(Model *m, int layer, int eid, uint32_t token){
     pthread_mutex_lock(&g_pilot_mx);
     if(layer<0 || layer>=256 || layer <= atomic_load_explicit(&g_cur_moe_layer,memory_order_acquire)){
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);   /* fuori range (come il ramo URING) o main gia' su questo layer */
@@ -6216,11 +6697,25 @@ static void pilot_realload(Model *m, int layer, int eid){
     g_pilot_inflight[layer]++;
     pthread_mutex_unlock(&g_pilot_mx);
 
+    int disk=expert_route(layer,eid);
+
+    /* Actual speculative expert read starts here. */
+    exec_trace_event(EXEC_EV_PILOT_IO_BEGIN,token,layer,eid,disk);
+
     int rc=expert_load(m,layer,eid,dst,0,0);            /* pread VERO — fuori dal lock, concorrente fra worker (come i PIPE demand); fatal=0: una speculazione fallita NON uccide il server; demand=0: speculative, never classified. Al successo expert_load setta dst->eid=eid. */
+
+    /* expert_load() has returned: all bytes for this logical expert
+     * load have been read/materialized. */
+    exec_trace_event(EXEC_EV_PILOT_IO_END,token,layer,eid,disk);
 
     pthread_mutex_lock(&g_pilot_mx);
     if(rc==0){
         ecache_publish(m,layer,dst,eid);
+
+        /* This is the point at which the normal demand path can
+         * actually discover and use the expert. */
+        exec_trace_event(EXEC_EV_PILOT_EXPERT_READY,token,layer,eid,disk);
+
         dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
@@ -6281,7 +6776,7 @@ static void pilot_uring_batch(Model *m){
         g_pilot_inflight[layer]++;
         pthread_mutex_unlock(&g_pilot_mx);
 
-        int li=uring_load_add(&g_ub_pilot,m,layer,eid,dst,0);
+        int li=uring_load_add(&g_ub_pilot,m,layer,eid,dst,0,0);
         if(li<0){
             pthread_mutex_lock(&g_pilot_mx); ecache_hide(m,layer,dst); g_pilot_inflight[layer]--;
             pthread_cond_broadcast(&g_pilot_cv); pthread_mutex_unlock(&g_pilot_mx);
@@ -6320,7 +6815,7 @@ static void pilot_uring_batch(Model *m){
 /* SPMC ring claim: each of N pilot workers grabs a UNIQUE ring index via CAS, never
  * advancing past pilot_w. Returns 1 and *out=index, or 0 if the ring is empty. The
  * producer stays single (main thread, only pilot_w) — this only splits the consumer. */
-static int pilot_ring_claim(int *out_l, int *out_e){
+static int pilot_ring_claim(int *out_l, int *out_e, uint32_t *out_token){
     for(;;){
         unsigned r=__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE);
         unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_ACQUIRE);
@@ -6330,10 +6825,12 @@ static int pilot_ring_claim(int *out_l, int *out_e){
          * below r+4096). If the CAS succeeds, pilot_r was r the whole time -> the read
          * is valid. If it fails, another worker advanced pilot_r; we discard and retry
          * (a torn read there is thrown away, never used). */
-        int l=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed), e=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed);
+        int l=atomic_load_explicit(&pilot_q[r&4095].l,memory_order_relaxed);
+        int e=atomic_load_explicit(&pilot_q[r&4095].e,memory_order_relaxed);
+        uint32_t token=atomic_load_explicit(&pilot_q[r&4095].token,memory_order_relaxed);
         if(__atomic_compare_exchange_n(&pilot_r,&r,r+1,/*weak=*/1,
                                        __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){
-            *out_l=l; *out_e=e; return 1;                /* claimed exactly one item, payload valid */
+            *out_l=l; *out_e=e; *out_token=token; return 1;  /* claimed exactly one item, payload valid */
         }
         /* lost the CAS race to another worker -> retry */
     }
@@ -6350,9 +6847,11 @@ static void *pilot_worker(void *arg){
             continue;
         }
 #endif
-        int l,e;                                        /* blocking / hint path: SPMC, one item per worker */
-        if(!pilot_ring_claim(&l,&e)){ usleep(200); continue; }
-        if(g_pilot_real) pilot_realload(pilot_m, l, e); /* QD=N: N concurrent preads instead of 1 */
+        int l,e;
+        uint32_t token;
+
+        if(!pilot_ring_claim(&l,&e,&token)){ usleep(200); continue; }
+        if(g_pilot_real) pilot_realload(pilot_m, l, e, token); /* QD=N: N concurrent preads instead of 1 */
         else             expert_prefetch(pilot_m, l, e);
     }
     return NULL;
@@ -6440,6 +6939,7 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
                     atomic_store_explicit(&pilot_q[w&4095].l,lt,memory_order_relaxed); atomic_store_explicit(&pilot_q[w&4095].e,best,memory_order_relaxed);
+                    atomic_store_explicit(&pilot_q[w&4095].token,g_exec_trace_token_base,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                     g_cp_enq++;
                 }
@@ -6448,7 +6948,8 @@ static void couple_prefetch(Model *m, int layer, const int *idx, int Ke){
     }
 }
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
-    Cfg *c=&m->c; Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
+    Cfg *c=&m->c;
+    for(int s=0;s<S;s++) exec_trace_event(EXEC_EV_PILOT_BEGIN,g_exec_trace_token_base+(uint32_t)s,lnext,-1,-1); Layer *l=&m->L[lnext]; int D=c->hidden, E=c->n_experts;
     int K = g_pilot_k<c->topk ? g_pilot_k : c->topk;
     pilot_spawn(m);
     float *nrm=falloc(D), *ch=falloc(E);
@@ -6483,6 +6984,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
             ch[best]=-2e30f;
+            exec_trace_event(EXEC_EV_PILOT_PREDICTED,g_exec_trace_token_base+(uint32_t)s,lnext,best,-1);
             /* Residency scan of the FUTURE layer lnext under g_pilot_mx: with
              * PILOT_REAL=1 the pilot worker mutates ecache[lnext]/ecn[lnext]
              * concurrently, so read them under the same lock (Option A). Decide
@@ -6502,6 +7004,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
                 unsigned w=__atomic_load_n(&pilot_w,__ATOMIC_RELAXED);
                 if(w-__atomic_load_n(&pilot_r,__ATOMIC_ACQUIRE)<4096){
                     atomic_store_explicit(&pilot_q[w&4095].l,lnext,memory_order_relaxed); atomic_store_explicit(&pilot_q[w&4095].e,best,memory_order_relaxed);
+                    atomic_store_explicit(&pilot_q[w&4095].token,g_exec_trace_token_base+(uint32_t)s,memory_order_relaxed);
                     __atomic_store_n(&pilot_w,w+1,__ATOMIC_RELEASE);
                 }
             }
@@ -6509,6 +7012,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
     }
     free(nrm); free(ch);
     if(can_two){ free(snrm); free(sg); free(su); free(sout); free(hc); }
+    for(int s=0;s<S;s++) exec_trace_event(EXEC_EV_PILOT_END,g_exec_trace_token_base+(uint32_t)s,lnext,-1,-1);
 }
 
 /* forward di UN layer (usato dai 78 principali e dal layer MTP) */
@@ -6796,6 +7300,8 @@ static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
 #endif
     double tl0=now_s();
     for(int i=layer_begin;i<layer_end;i++){
+        g_exec_trace_token_base=(uint32_t)pos_base;
+        for(int s=0;s<S;s++) exec_trace_event(EXEC_EV_LAYER_BEGIN,(uint32_t)(pos_base+s),i,-1,-1);
         /* progresso su stderr per i batch grossi (prefill): il primo byte di risposta
          * puo' arrivare dopo MINUTI di streaming — al buio sembra un blocco. */
         if(S>=8 && (i%4==0 || i==layer_end-1))
@@ -6847,6 +7353,7 @@ static void layers_forward_rows_range(Model *m, float *x, int S, int pos_base,
         }
 #endif
         layer_forward_rows(m,&m->L[i],i,x,S,pos_base,kvs,positions,nrm,tmp);
+        for(int s=0;s<S;s++) exec_trace_event(EXEC_EV_LAYER_END,(uint32_t)(pos_base+s),i,-1,-1);
     }
 #ifdef COLI_CUDA
     if(x_dev_on>=0) coli_cuda_pipe_download(x_dev_on,x_dev,x,xb);
@@ -6951,6 +7458,10 @@ static void kv_bind(Model *m, KVState *k){
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base);
 static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
+    if(g_exec_trace.enabled && !atomic_load_explicit(&g_exec_trace.request_active,memory_order_relaxed)) exec_trace_request_begin();
+    int trace_pos_base=pos_base, trace_S=S;
+    g_exec_trace_token_base=(uint32_t)pos_base;
+    for(int s=0;s<S;s++) exec_trace_event(EXEC_EV_TOKEN_BEGIN,(uint32_t)(pos_base+s),-1,-1,-1);
     /* Chunked prefill (COLI_PREFILL_CHUNK=N): run a long prompt through the
      * layers in N-token slices. KV rows are position-addressed, so a slice at
      * pos_base+done is exactly the serve path's incremental suffix prefill —
@@ -6983,11 +7494,16 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     double th0=now_s();
     float *logit=falloc(c->vocab); matmul_qt(logit,last,&m->lm_head,1);
     m->t_head += now_s()-th0;
-    free(x); free(last); return logit;
+    free(x); free(last);
+    for(int s=0;s<trace_S;s++) exec_trace_event(EXEC_EV_TOKEN_END,(uint32_t)(trace_pos_base+s),-1,-1,-1);
+    return logit;
 }
 
 /* come step(), ma ritorna i logits di TUTTE le S posizioni [S,vocab] (per la verifica spec) */
 static float *step_all(Model *m, const int *ids, int S, int pos_base){
+    if(g_exec_trace.enabled && !atomic_load_explicit(&g_exec_trace.request_active,memory_order_relaxed)) exec_trace_request_begin();
+    g_exec_trace_token_base=(uint32_t)pos_base;
+    for(int ts=0;ts<S;ts++) exec_trace_event(EXEC_EV_TOKEN_BEGIN,(uint32_t)(pos_base+ts),-1,-1,-1);
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
@@ -7036,6 +7552,7 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
     matmul_qt(logit,norm,&m->lm_head,S);
     m->t_head+=now_s()-th0;
     free(x); free(norm);
+    for(int ts=0;ts<S;ts++) exec_trace_event(EXEC_EV_TOKEN_END,(uint32_t)positions[ts],-1,-1,-1);
     return logit;
 }
 
@@ -7336,6 +7853,7 @@ static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,const float*,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
+    exec_trace_event(EXEC_EV_GENERATION_BEGIN,(uint32_t)kv,-1,-1,-1);
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
     /* #163: draft del modello attivi -> pin della famiglia di kernel per draft+verifica.
@@ -8449,6 +8967,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
      * share the batched forwards, so the shares describe the engine, not the
      * single request (same convention as the STAT hit%% above). */
+    exec_trace_request_end();
     if(g_prof) prof_report(m,&r->pb,dt,r->emitted,stderr);
     if(r->spec_logit){ free(r->spec_logit); r->spec_logit=NULL; }
     r->spec=0;
@@ -9309,6 +9828,7 @@ static double mirror_probe_bw(shards *S,int rep){
  * any pin/autopin load, so the OMP-parallel pin warmup streams from all drives. */
 static void mirror_setup(Model *m){
     if(!g_mirror_dir) return;
+    exec_trace_init();
     const char *snap=getenv("SNAP"); if(!snap||!*snap) snap=getenv("COLI_MODEL");
     st_mirror_reset(&m->S);
     int nrep=1;
